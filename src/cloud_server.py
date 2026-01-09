@@ -72,6 +72,9 @@ def health():
         "msgpack_enabled": HAS_MSGPACK,
     })
 
+@app.get("/ping")
+def ping():
+    return jsonify({"status": "ok", "service": "cloud", "time_utc": now_iso()})
 
 @app.post("/continue")
 def continue_inference():

@@ -19,6 +19,7 @@ app = Flask(__name__)
 DEFAULT_LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
 LOG_FILE_NAME = "edge_requests.jsonl"
 
+SESSION = requests.Session()
 
 def now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
@@ -93,7 +94,7 @@ def call_cloud_continue(cloud_url: str, sample_id: Any, from_exit: str,
 
     t0 = time.perf_counter()
     try:
-        r = requests.post(url, json=req, timeout=timeout_s)
+        r = SESSION.post(url, json=req, timeout=timeout_s)
         t1 = time.perf_counter()
         rtt_ms = (t1 - t0) * 1000.0
         if r.status_code != 200:
