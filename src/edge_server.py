@@ -253,7 +253,7 @@ def infer():
         if decision in ("exit0", "exit1", "final"):
             logits = result["logits"]
         elif decision == "offload":
-            feat = result["feat"]
+            feat = result["feature"]
             cloud_url = app.config.get("CLOUD_URL", None)
             timeout_s = app.config.get("CLOUD_TIMEOUT_S", 10.0)
 
