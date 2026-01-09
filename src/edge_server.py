@@ -13,9 +13,9 @@ import torch.nn.functional as F
 from torchvision import transforms
 
 from mvit_backbone import mobilevit_xxs
-from mvit_ee_paper import MobileViTMultiExitLogits
+from mvit_policy_model import MobileViTWithPolicy
 from criterions import score_entropy, score_margin, score_maxprob
-from payloads import decode_u8_image_bytes, u8_to_pil_rgb
+from payloads import decode_u8_image_bytes, u8_to_pil_rgb, tensor_to_payload, payload_to_tensor
 
 import msgpack
 
@@ -93,51 +93,61 @@ def load_model(device: torch.device, backbone_ckpt: str, ee_ckpt: str, num_class
     base = mobilevit_xxs()
     base.load_state_dict(torch.load(backbone_ckpt, map_location="cpu"))
 
-    multi = MobileViTMultiExitLogits(
+    policy_model = MobileViTWithPolicy(
         base_model=base,
-        exit_points=("mvit_0", "mvit_1"),
-        num_classes=num_classes
+        exit_points=('mvit_0', 'mvit_1'),
+        num_classes=num_classes,
     )
-    multi.load_state_dict(torch.load(ee_ckpt, map_location="cpu"), strict=False)
-    multi = multi.to(device).eval()
-    return multi
 
-def choose_exit_or_offload(outputs: dict, criterion: str, thr0: float, thr1: float):
-    z0 = outputs["logits_mvit_0"]
-    z1 = outputs["logits_mvit_1"]
+    policy_model.load_state_dict(torch.load(ee_ckpt, map_location="cpu"), strict=False)
+    policy_model = policy_model.to(device).eval()
 
-    if criterion == "maxprob":
-        s0 = score_maxprob(z0)
-        s1 = score_maxprob(z1)
-        pass0 = s0 >= thr0
-        pass1 = s1 >= thr1
-    elif criterion == "margin":
-        s0 = score_margin(z0)
-        s1 = score_margin(z1)
-        pass0 = s0 >= thr0
-        pass1 = s1 >= thr1
-    elif criterion == "entropy":
-        s0 = score_entropy(z0)
-        s1 = score_entropy(z1)
-        pass0 = s0 <= thr0
-        pass1 = s1 <= thr1
-    else:
-        raise ValueError("criterion must be one of: maxprob, margin, entropy")
-
-    if pass0.item():
-        return "exit0", float(s0.item()), float(s1.item())
-    if pass1.item():
-        return "exit1", float(s0.item()), float(s1.item())
-    return "offload", float(s0.item()), float(s1.item())
+    return policy_model
 
 
-def dummy_offload_placeholder(outputs: dict) -> torch.Tensor:
+def offload_to_cloud(sample_id: Any, from_exit: str, feat_tensor: torch.Tensor,
+                     cloud_url: str, timeout_s: float = 10.0) -> Tuple[Optional[torch.Tensor], Optional[float], Optional[str]]:
     """
-    Placeholder OFFLOAD behavior (no networking yet):
-    - for debugging, we use logits_final computed on edge.
-    Later: send features to cloud and receive logits.
+    Sends feature tensor to cloud /continue via msgpack, returns logits tensor (CPU).
     """
-    return outputs["logits_final"]
+    url = cloud_url.rstrip("/") + "/continue"
+
+    req = {
+        "sample_id": sample_id,
+        "from_exit": from_exit,
+        "features": tensor_to_payload(feat_tensor),
+    }
+
+    body = msgpack.packb(req, use_bin_type=True)
+    headers = {
+        "Content-Type": "application/msgpack",
+        "Accept": "application/msgpack",
+    }
+
+    t0 = time.perf_counter()
+    try:
+        r = SESSION.post(url, data=body, headers=headers, timeout=timeout_s)
+        t1 = time.perf_counter()
+        rtt_ms = (t1 - t0) * 1000.0
+
+        if r.status_code != 200:
+            return None, rtt_ms, f"cloud_http_{r.status_code}: {r.text[:200]}"
+
+        ct = (r.headers.get("Content-Type") or "").lower()
+        if "application/msgpack" in ct:
+            resp = msgpack.unpackb(r.content, raw=False)
+        else:
+            resp = r.json()
+
+        if "logits" not in resp:
+            return None, rtt_ms, "cloud_response_missing_logits"
+
+        logits = payload_to_tensor(resp["logits"], device="cpu")
+        return logits, rtt_ms, None
+
+    except Exception as e:
+        t1 = time.perf_counter()
+        return None, (t1 - t0) * 1000.0, str(e)
 
 
 @app.get("/health")
@@ -213,23 +223,59 @@ def infer():
     thr0 = float(policy.get("thr0", 0.90))
     thr1 = float(policy.get("thr1", 0.95))
 
+    allow_offload = True
+    offload_from = payload.get("offload_from", "mvit_1")
+    debug_final = bool(payload.get("debug_final", False))
+
     # --- Inference timing (GPU sync matters) ---
+    edge_cloud_rtt_ms = None
+    cloud_error = None
+
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
 
     with torch.inference_mode():
-        outputs = model(x)
-        decision, s0, s1 = choose_exit_or_offload(outputs, criterion, thr0, thr1)
+        result = model(
+            x,
+            criterion=criterion,
+            thr0=thr0,
+            thr1=thr1,
+            allow_offload=allow_offload,
+            offload_from=offload_from,
+            debug_compute_final=debug_final,
+        )
 
-        if decision == "exit0":
-            logits = outputs["logits_mvit_0"]
-        elif decision == "exit1":
-            logits = outputs["logits_mvit_1"]
+        decision = result["decision"]
+        s0 = result.get("score_exit0")
+        s1 = result.get("score_exit1")
+
+        if decision in ("exit0", "exit1", "final"):
+            logits = result["logits"]
+        elif decision == "offload":
+            feat = result["feat"]
+            cloud_url = app.config.get("CLOUD_URL", None)
+            timeout_s = app.config.get("CLOUD_TIMEOUT_S", 10.0)
+
+            if cloud_url:
+                logits, edge_cloud_rtt_ms, cloud_error = offload_to_cloud(
+                    sample_id=sample_id,
+                    from_exit=offload_from,
+                    feat_tensor=feat,
+                    cloud_url=cloud_url,
+                    timeout_s=timeout_s
+                )
+            else:
+                return jsonify({
+                    "error": "cloud_url_not_configured",
+                    "message": "CLOUD_URL is not configured."
+                }), 400
         else:
-            # OFFLOAD placeholder: use final logits locally
-            logits = dummy_offload_placeholder(outputs)
-
+            return jsonify({
+                "error": "invalid_decision",
+                "message": f"Model returned invalid decision: {decision}"
+            }), 500
+        
         pred = int(logits.argmax(dim=1).item())
 
     if device.type == "cuda":

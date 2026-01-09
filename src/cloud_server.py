@@ -1,17 +1,13 @@
 import os
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Tuple
 
 from flask import Flask, request, jsonify, Response
+import msgpack
+import numpy as np
 
-# Optional msgpack support (recommended for tensor payloads later)
-try:
-    import msgpack
-    HAS_MSGPACK = True
-except Exception:
-    HAS_MSGPACK = False
 
 app = Flask(__name__)
 
@@ -25,7 +21,7 @@ def ensure_log_dir(log_dir: str) -> str:
 
 
 def now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def parse_payload() -> Tuple[Dict[str, Any], str]:
@@ -69,12 +65,8 @@ def health():
         "status": "ok",
         "service": "cloud",
         "time_utc": now_iso(),
-        "msgpack_enabled": HAS_MSGPACK,
     })
 
-@app.get("/ping")
-def ping():
-    return jsonify({"status": "ok", "service": "cloud", "time_utc": now_iso()})
 
 @app.post("/continue")
 def continue_inference():
@@ -83,22 +75,30 @@ def continue_inference():
     try:
         payload, used_ct = parse_payload()
     except Exception as e:
-        return jsonify({
-            "error": "bad_request",
-            "message": str(e),
-        }), 400
+        return jsonify({"error": "bad_request", "message": str(e)}), 400
 
-    # Minimal fields we expect (optional for now)
     sample_id = payload.get("sample_id", None)
     from_exit = payload.get("from_exit", None)
 
-    # Placeholder “compute”
-    # (Later: deserialize features, run model continuation)
-    time.sleep(0.002)  # 2ms fake compute
+    # Expect features in msgpack-friendly tensor payload format
+    feat = payload.get("features", None)
+    if feat is None:
+        return jsonify({"error": "bad_request", "message": "Missing 'features'"}), 400
 
-    # Placeholder response
-    pred = 0
-    logits_final = None  # keep None until real model is added
+    # Minimal validation (we won't run model yet)
+    try:
+        dtype = feat["dtype"]
+        shape = feat["shape"]
+        data_len = len(feat["data"])
+    except Exception as e:
+        return jsonify({"error": "bad_features", "message": str(e)}), 400
+
+    # Placeholder "cloud compute"
+    time.sleep(0.002)
+
+    # Create placeholder logits: (1,10) float32 all zeros except class 0
+    logits = np.zeros((1, 10), dtype=np.float32)
+    logits[0, 0] = 1.0
 
     t1 = time.perf_counter()
     cloud_compute_ms = (t1 - t0) * 1000.0
@@ -106,27 +106,28 @@ def continue_inference():
     resp = {
         "sample_id": sample_id,
         "from_exit": from_exit,
-        "pred": pred,
-        "logits_final": logits_final,
         "cloud_compute_ms": cloud_compute_ms,
         "received_content_type": used_ct,
         "time_utc": now_iso(),
-        "note": "placeholder cloud response (no model yet)",
+        "note": "placeholder cloud continuation (features received, logits dummy)",
+        # send logits as tensor payload too
+        "logits": {
+            "dtype": str(logits.dtype),
+            "shape": list(logits.shape),
+            "data": logits.tobytes(order="C")
+        },
+        "features_meta": {
+            "dtype": dtype,
+            "shape": shape,
+            "data_len": data_len
+        }
     }
 
-    # Log request/response summary (avoid logging huge payloads)
-    log_dir = app.config.get("LOG_DIR", DEFAULT_LOG_DIR)
-    log_path = ensure_log_dir(log_dir)
-    log_record = {
-        "time_utc": resp["time_utc"],
-        "endpoint": "/continue",
-        "sample_id": sample_id,
-        "from_exit": from_exit,
-        "received_content_type": used_ct,
-        "cloud_compute_ms": cloud_compute_ms,
-        "payload_keys": sorted(list(payload.keys())) if isinstance(payload, dict) else [],
-    }
-    append_jsonl(log_path, log_record)
+    # If client asked for msgpack, return msgpack; else JSON
+    accept = (request.headers.get("Accept") or "").lower()
+    if "application/msgpack" in accept or "application/x-msgpack" in accept:
+        body = msgpack.packb(resp, use_bin_type=True)
+        return Response(body, content_type="application/msgpack")
 
     return jsonify(resp)
 
@@ -145,7 +146,6 @@ def main():
 
     print(f"[cloud] starting on http://{args.host}:{args.port}")
     print(f"[cloud] logs: {os.path.abspath(args.log_dir)}")
-    print(f"[cloud] msgpack enabled: {HAS_MSGPACK}")
 
     # NOTE: Flask dev server is fine for your prototype.
     # Later you can switch to gunicorn for robustness.
