@@ -1,14 +1,13 @@
-import torch.nn as nn
-import torch.Tensor
+import torch
 
-class MobileViTCloudContinuation(nn.Module):
+class MobileViTCloudContinuation(torch.nn.Module):
     """
     Runs the remaining layers given a feature tensor from exit0 or exit1.
     Assumes feature tensor is exactly what edge sends:
       - mvit_0 feature: output of base.mvit[0](...)
       - mvit_1 feature: output of base.mvit[1](...)
     """
-    def __init__(self, base_model: nn.Module):
+    def __init__(self, base_model: torch.nn.Module):
         super().__init__()
         self.base = base_model
 
