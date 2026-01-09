@@ -1,5 +1,6 @@
 # src/payloads.py
 import numpy as np
+import torch
 from PIL import Image
 
 def decode_u8_image_bytes(img_bytes: bytes, shape_hw3=(32, 32, 3)) -> np.ndarray:
@@ -19,3 +20,30 @@ def u8_to_pil_rgb(img_u8_hwc: np.ndarray) -> Image.Image:
     if img_u8_hwc.ndim != 3 or img_u8_hwc.shape[2] != 3:
         raise ValueError("Expected HxWx3 image")
     return Image.fromarray(img_u8_hwc, mode="RGB")
+
+def tensor_to_payload(t: torch.Tensor) -> dict:
+    """
+    Converts a torch tensor to a msgpack-friendly dict:
+      - dtype (string)
+      - shape (list)
+      - data (bytes)
+    Always sends CPU contiguous bytes.
+    """
+    t_cpu = t.detach().to("cpu").contiguous()
+    arr = t_cpu.numpy()  # shares memory with t_cpu
+    return {
+        "dtype": str(arr.dtype),           # e.g. 'float32'
+        "shape": list(arr.shape),          # e.g. [1, 64, 16, 16]
+        "data": arr.tobytes(order="C"),    # raw bytes
+    }
+
+def payload_to_tensor(p: dict, device: str = "cpu") -> torch.Tensor:
+    """
+    Reconstruct torch tensor from dict produced by tensor_to_payload.
+    """
+    dtype = np.dtype(p["dtype"])
+    shape = tuple(p["shape"])
+    data = p["data"]
+    arr = np.frombuffer(data, dtype=dtype).reshape(shape)
+    t = torch.from_numpy(arr)
+    return t.to(device)
