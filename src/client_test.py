@@ -135,16 +135,25 @@ def main():
 
     if cloud_health:
         print(f"[client] cloud health: {cloud_health}")
-        cloud_h = safe_get_json(cloud_health, args.timeout_s)
-        print("[client] cloud health ok:", cloud_h)
+        try:
+            cloud_h = safe_get_json(cloud_health, args.timeout_s)
+            print("[client] cloud health ok:", cloud_h)
+        except Exception as e:
+            print("[client] cloud health check failed:", str(e))
+            cloud_health = None
+            cloud_ping = None
 
     # 2) Ping baseline
     ping_stats = None
     if cloud_ping:
         print(f"[client] cloud ping baseline: {cloud_ping}")
-        ping_stats = run_ping(cloud_ping, n=min(10, args.n), timeout_s=args.timeout_s)
-        print("[client] cloud ping stats:", ping_stats)
-
+        try:
+            ping_stats = run_ping(cloud_ping, n=min(10, args.n), timeout_s=args.timeout_s)
+            print("[client] cloud ping stats:", ping_stats)
+        except Exception as e:
+            print("[client] cloud ping failed:", str(e))
+            ping_stats = None
+            
     # 3) Main loop
     counts = defaultdict(int)
     rtts = []

@@ -76,6 +76,20 @@ def should_offload(payload: Dict[str, Any]) -> bool:
         return True
     return False
 
+def call_cloud_ping(cloud_url: str, timeout_s: float = 5.0) -> Tuple[Optional[dict], Optional[float], Optional[str]]:
+    url = cloud_url.rstrip("/") + "/ping"
+    t0 = time.perf_counter()
+    try:
+        r = SESSION.get(url, timeout=timeout_s)
+        t1 = time.perf_counter()
+        rtt_ms = (t1 - t0) * 1000.0
+        if r.status_code != 200:
+            return None, rtt_ms, f"cloud_http_{r.status_code}: {r.text[:200]}"
+        return r.json(), rtt_ms, None
+    except Exception as e:
+        t1 = time.perf_counter()
+        return None, (t1 - t0) * 1000.0, str(e)
+
 
 def call_cloud_continue(cloud_url: str, sample_id: Any, from_exit: str,
                         timeout_s: float = 5.0) -> Tuple[Optional[Dict[str, Any]], Optional[float], Optional[str]]:
@@ -114,6 +128,25 @@ def health():
         "time_utc": now_iso(),
         "msgpack_enabled": HAS_MSGPACK,
         "cloud_url": app.config.get("CLOUD_URL"),
+    })
+
+@app.get("/cloud_ping")
+def cloud_ping():
+    cloud_url = app.config.get("CLOUD_URL")
+    if not cloud_url:
+        return jsonify({"error": "CLOUD_URL not configured"}), 400
+
+    resp, rtt_ms, err = call_cloud_ping(
+        cloud_url=cloud_url,
+        timeout_s=app.config.get("CLOUD_TIMEOUT_S", 5.0)
+    )
+    return jsonify({
+        "cloud_url": cloud_url,
+        "ok": err is None,
+        "edge_cloud_rtt_ms": rtt_ms,
+        "cloud_response": resp,
+        "error": err,
+        "time_utc": now_iso(),
     })
 
 
