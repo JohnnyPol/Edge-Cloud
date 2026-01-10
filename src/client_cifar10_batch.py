@@ -105,6 +105,11 @@ def safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+def sweep_key(criterion: str, thr0: float, thr1: float) -> Tuple[str, float, float]:
+    # stable key for matching sweeps in results.csv
+    return (criterion, float(thr0), float(thr1))
+
+
 
 def extract_energy_metrics(d: Optional[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     """
@@ -209,6 +214,228 @@ class SweepResult:
     cloud_co2_kg: Optional[float]
 
 
+def load_results_csv(csv_path: str) -> List[SweepResult]:
+    """
+    Load existing results.csv into SweepResult list so we don't overwrite progress.
+    """
+    if not os.path.exists(csv_path):
+        return []
+
+    rows: List[SweepResult] = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        r = csv.DictReader(f)
+
+        def fnum(v: Any) -> Optional[float]:
+            if v in (None, "", "None"):
+                return None
+            try:
+                return float(v)
+            except Exception:
+                return None
+
+        def fint(v: Any) -> int:
+            if v in (None, "", "None"):
+                return 0
+            try:
+                return int(float(v))
+            except Exception:
+                return 0
+
+        for row in r:
+            rows.append(
+                SweepResult(
+                    criterion=row["criterion"],
+                    thr0=float(row["thr0"]),
+                    thr1=float(row["thr1"]),
+                    n_total=fint(row.get("n_total")),
+                    n_ok=fint(row.get("n_ok")),
+                    n_fail=fint(row.get("n_fail")),
+                    accuracy=fnum(row.get("accuracy")),
+                    exit0_pct=float(row.get("exit0_pct", 0.0)),
+                    exit1_pct=float(row.get("exit1_pct", 0.0)),
+                    offload_pct=float(row.get("offload_pct", 0.0)),
+                    final_pct=float(row.get("final_pct", 0.0)),
+                    client_rtt_avg=fnum(row.get("client_rtt_avg")),
+                    client_rtt_p95=fnum(row.get("client_rtt_p95")),
+                    total_edge_avg=fnum(row.get("total_edge_avg")),
+                    total_edge_p95=fnum(row.get("total_edge_p95")),
+                    edge_infer_avg=fnum(row.get("edge_infer_avg")),
+                    edge_infer_p95=fnum(row.get("edge_infer_p95")),
+                    edge_cloud_rtt_avg=fnum(row.get("edge_cloud_rtt_avg")),
+                    edge_cloud_rtt_p95=fnum(row.get("edge_cloud_rtt_p95")),
+                    cloud_compute_avg=fnum(row.get("cloud_compute_avg")),
+                    cloud_compute_p95=fnum(row.get("cloud_compute_p95")),
+                    total_cloud_avg=fnum(row.get("total_cloud_avg")),
+                    total_cloud_p95=fnum(row.get("total_cloud_p95")),
+                    edge_energy_kwh=fnum(row.get("edge_energy_kwh")),
+                    edge_co2_kg=fnum(row.get("edge_co2_kg")),
+                    cloud_energy_kwh=fnum(row.get("cloud_energy_kwh")),
+                    cloud_co2_kg=fnum(row.get("cloud_co2_kg")),
+                )
+            )
+    return rows
+
+
+def completed_sample_ids_for_run(jsonl_path: str, run_id: str) -> set:
+    """
+    Returns the set of sample_ids that have SUCCESSFULLY completed (http_status==200)
+    for a given run_id.
+    """
+    done = set()
+    if not os.path.exists(jsonl_path):
+        return done
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("run_id") != run_id:
+                continue
+            if rec.get("http_status") == 200:
+                sid = rec.get("sample_id")
+                if sid is None:
+                    continue
+                try:
+                    done.add(int(sid))
+                except Exception:
+                    pass
+    return done
+
+
+def recompute_sweep_from_jsonl(
+    run_id: str,
+    jsonl_path: str,
+    n_total_target: int,
+    criterion: str,
+    thr0: float,
+    thr1: float,
+) -> SweepResult:
+    """
+    Recompute sweep aggregates from JSONL so resume is correct across restarts.
+    Counts each sample_id at most once (first successful occurrence).
+    """
+    decision_counts = {"exit0": 0, "exit1": 0, "offload": 0, "final": 0, "other": 0}
+
+    n_ok = 0
+    n_fail = 0
+    correct = 0
+
+    client_rtts: List[float] = []
+    total_edges: List[float] = []
+    edge_infers: List[float] = []
+
+    edge_cloud_rtts: List[float] = []
+    cloud_computes: List[float] = []
+    total_clouds: List[float] = []
+
+    seen_ok = set()
+
+    if not os.path.exists(jsonl_path):
+        raise RuntimeError(f"Missing JSONL file: {jsonl_path}")
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("run_id") != run_id:
+                continue
+
+            http_status = rec.get("http_status")
+            sid = rec.get("sample_id")
+
+            if http_status == 200 and sid is not None:
+                try:
+                    sid = int(sid)
+                except Exception:
+                    continue
+                if sid in seen_ok:
+                    continue
+                seen_ok.add(sid)
+
+                n_ok += 1
+                if rec.get("correct") is True:
+                    correct += 1
+
+                d = rec.get("decision")
+                if d in decision_counts:
+                    decision_counts[d] += 1
+                else:
+                    decision_counts["other"] += 1
+
+                # timings
+                client_rtt_ms = safe_float(rec.get("client_rtt_ms"))
+                total_edge_ms = safe_float(rec.get("total_edge_ms"))
+                edge_infer_ms = safe_float(rec.get("edge_infer_ms"))
+
+                edge_cloud_rtt_ms = safe_float(rec.get("edge_cloud_rtt_ms"))
+                cloud_compute_ms = safe_float(rec.get("cloud_compute_ms"))
+                total_cloud_ms = safe_float(rec.get("total_cloud_ms"))
+
+                if client_rtt_ms is not None:
+                    client_rtts.append(client_rtt_ms)
+                if total_edge_ms is not None:
+                    total_edges.append(total_edge_ms)
+                if edge_infer_ms is not None:
+                    edge_infers.append(edge_infer_ms)
+
+                if edge_cloud_rtt_ms is not None:
+                    edge_cloud_rtts.append(edge_cloud_rtt_ms)
+                if cloud_compute_ms is not None:
+                    cloud_computes.append(cloud_compute_ms)
+                if total_cloud_ms is not None:
+                    total_clouds.append(total_cloud_ms)
+            else:
+                # counts failures too (not deduped; just informational)
+                n_fail += 1
+
+    accuracy = (correct / n_ok) if n_ok > 0 else None
+
+    exit0_pct = (decision_counts["exit0"] / n_ok) * 100.0 if n_ok else 0.0
+    exit1_pct = (decision_counts["exit1"] / n_ok) * 100.0 if n_ok else 0.0
+    offload_pct = (decision_counts["offload"] / n_ok) * 100.0 if n_ok else 0.0
+    final_pct = (decision_counts["final"] / n_ok) * 100.0 if n_ok else 0.0
+
+    return SweepResult(
+        criterion=criterion,
+        thr0=float(thr0),
+        thr1=float(thr1),
+        n_total=n_total_target,
+        n_ok=n_ok,
+        n_fail=n_fail,
+        accuracy=accuracy,
+        exit0_pct=exit0_pct,
+        exit1_pct=exit1_pct,
+        offload_pct=offload_pct,
+        final_pct=final_pct,
+        client_rtt_avg=mean(client_rtts),
+        client_rtt_p95=percentile(client_rtts, 95),
+        total_edge_avg=mean(total_edges),
+        total_edge_p95=percentile(total_edges, 95),
+        edge_infer_avg=mean(edge_infers),
+        edge_infer_p95=percentile(edge_infers, 95),
+        edge_cloud_rtt_avg=mean(edge_cloud_rtts),
+        edge_cloud_rtt_p95=percentile(edge_cloud_rtts, 95),
+        cloud_compute_avg=mean(cloud_computes),
+        cloud_compute_p95=percentile(cloud_computes, 95),
+        total_cloud_avg=mean(total_clouds),
+        total_cloud_p95=percentile(total_clouds, 95),
+        edge_energy_kwh=None,
+        edge_co2_kg=None,
+        cloud_energy_kwh=None,
+        cloud_co2_kg=None,
+    )
+
+
 def run_sweep(
     session: requests.Session,
     edge_infer_url: str,
@@ -221,6 +448,7 @@ def run_sweep(
     accept_msgpack: bool,
     jsonl_path: str,
     run_id: str,
+    done_sample_ids: Optional[set] = None,
 ) -> SweepResult:
     headers = {"Content-Type": "application/msgpack"}
     if accept_msgpack:
@@ -231,6 +459,9 @@ def run_sweep(
     n_ok = 0
     n_fail = 0
     correct = 0
+
+    # Already done sample IDs (for resuming)
+    done_sample_ids = done_sample_ids or set()
 
     decision_counts = {"exit0": 0, "exit1": 0, "offload": 0, "final": 0, "other": 0}
 
@@ -244,6 +475,8 @@ def run_sweep(
     total_clouds: List[float] = []
 
     for sample_id in indices:
+        if sample_id in done_sample_ids:
+            continue
         pil_img, true_label = ds[sample_id]
         img_u8 = np.array(pil_img, dtype=np.uint8)
 
@@ -466,7 +699,7 @@ def main():
     ap.add_argument(
         "--num_samples",
         type=int,
-        default=-1,
+        default=1000,
         help="Number of CIFAR-10 test samples per sweep",
     )
     ap.add_argument(
@@ -544,25 +777,33 @@ def main():
         return
 
     session = requests.Session()
-    results: List[SweepResult] = []
+    results: List[SweepResult] = load_results_csv(args.out_csv)
+    completed = {sweep_key(r.criterion, r.thr0, r.thr1) for r in results}
+    print(f"[client] loaded {len(results)} completed sweeps from results.csv")
 
-    # Run sweeps
+
+    # Run sweeps (resume-safe)
     for i, (criterion, thr0, thr1) in enumerate(sweep_triplets, start=1):
+        # Check if already done
+        key = sweep_key(criterion, thr0, thr1)
+        if key in completed:
+            print(f"[client] sweep {i}/{len(sweep_triplets)} already done -> skip ({criterion} thr0={thr0} thr1={thr1})")
+            continue
+
         run_id = f"{criterion}_thr0={thr0:.4f}_thr1={thr1:.4f}_seed={args.seed}_n={len(indices)}"
+        done_ids = completed_sample_ids_for_run(args.out_jsonl, run_id)
+
         print(f"\n[client] sweep {i}/{len(sweep_triplets)}  {run_id}")
+        print(f"[client] resume: {len(done_ids)}/{len(indices)} samples already completed for this sweep")
 
-        # Energy tracking (optional; endpoints not implemented yet)
-        edge_energy = None
-        cloud_energy = None
-        _ = energy_start(
-            session, args.edge_url, run_id=run_id, timeout_s=args.timeout_s
-        )
-        if cloud_url:
-            _ = energy_start(
-                session, cloud_url, run_id=run_id, timeout_s=args.timeout_s
-            )
+        # Start energy only if starting this sweep from scratch
+        if len(done_ids) == 0:
+            _ = energy_start(session, args.edge_url, run_id=run_id, timeout_s=args.timeout_s)
+            if cloud_url:
+                _ = energy_start(session, cloud_url, run_id=run_id, timeout_s=args.timeout_s)
 
-        res = run_sweep(
+        # Run only remaining samples
+        _partial_res = run_sweep(
             session=session,
             edge_infer_url=edge_infer_url,
             ds=ds,
@@ -574,39 +815,50 @@ def main():
             accept_msgpack=args.accept_msgpack,
             jsonl_path=args.out_jsonl,
             run_id=run_id,
+            done_sample_ids=done_ids,
         )
 
-        # Stop energy tracking (optional)
-        edge_stop = energy_stop(
-            session, args.edge_url, run_id=run_id, timeout_s=args.timeout_s
+        # Check completion after this run
+        done_after = completed_sample_ids_for_run(args.out_jsonl, run_id)
+        print(f"[client] progress: {len(done_after)}/{len(indices)} completed")
+
+        if len(done_after) < len(indices):
+            print("[client] sweep not complete yet. Re-run script to continue from the same point.")
+            continue
+
+        # Sweep complete -> stop energy
+        edge_stop = energy_stop(session, args.edge_url, run_id=run_id, timeout_s=args.timeout_s)
+        cloud_stop = energy_stop(session, cloud_url, run_id=run_id, timeout_s=args.timeout_s) if cloud_url else None
+
+        edge_energy_kwh, edge_co2_kg, _ = extract_energy_metrics(edge_stop)
+        cloud_energy_kwh, cloud_co2_kg, _ = extract_energy_metrics(cloud_stop)
+
+        # Recompute full sweep stats from JSONL (correct across resumes)
+        res = recompute_sweep_from_jsonl(
+            run_id=run_id,
+            jsonl_path=args.out_jsonl,
+            n_total_target=len(indices),
+            criterion=criterion,
+            thr0=thr0,
+            thr1=thr1,
         )
-        cloud_stop = None
-        if cloud_url:
-            cloud_stop = energy_stop(
-                session, cloud_url, run_id=run_id, timeout_s=args.timeout_s
-            )
 
-        edge_energy_kwh, edge_co2_kg, _edge_dur_s = extract_energy_metrics(edge_stop)
-        cloud_energy_kwh, cloud_co2_kg, _cloud_dur_s = extract_energy_metrics(cloud_stop)
-
-        # Attach to SweepResult
         res.edge_energy_kwh = edge_energy_kwh
         res.edge_co2_kg = edge_co2_kg
         res.cloud_energy_kwh = cloud_energy_kwh
         res.cloud_co2_kg = cloud_co2_kg
 
         results.append(res)
+        completed.add(key)
 
         print(
-            f"[client] n_ok={res.n_ok}/{res.n_total} acc={res.accuracy if res.accuracy is not None else 'NA'}"
+            f"[client] COMPLETE n_ok={res.n_ok}/{res.n_total} acc={res.accuracy if res.accuracy is not None else 'NA'}"
         )
         print(
             f"[client] exits: exit0={res.exit0_pct:.1f}% exit1={res.exit1_pct:.1f}% offload={res.offload_pct:.1f}%"
         )
-        print(f"[client] client_rtt avg={res.client_rtt_avg} p95={res.client_rtt_p95}")
-        print(f"[client] total_edge avg={res.total_edge_avg} p95={res.total_edge_p95}")
 
-        # Write CSV incrementally for safety
+        # Write CSV incrementally (but preserve previous results because we loaded them)
         write_csv(args.out_csv, results)
 
     print("\n[client] done.")
