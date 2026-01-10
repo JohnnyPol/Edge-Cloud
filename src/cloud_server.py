@@ -7,6 +7,8 @@ from typing import Any, Dict, Tuple, Optional
 from flask import Flask, request, jsonify, Response
 import msgpack
 import torch
+from codecarbon import EmissionsTracker
+import threading
 
 from mvit_backbone import mobilevit_xxs
 from mvit_cloud import MobileViTCloudContinuation
@@ -17,10 +19,34 @@ app = Flask(__name__)
 DEFAULT_LOG_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
 LOG_FILE_NAME = "cloud_requests.jsonl"
 
+ENERGY_LOG_FILE_NAME = "cloud_energy.jsonl"
+_TRACKERS_LOCK = threading.Lock()
+_ACTIVE_TRACKERS: Dict[str, EmissionsTracker] = {}
+
 
 def ensure_log_path(log_dir: str) -> str:
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, LOG_FILE_NAME)
+
+
+def ensure_energy_log_path(log_dir: str) -> str:
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, ENERGY_LOG_FILE_NAME)
+
+
+def _make_tracker(log_dir: str, run_id: str) -> EmissionsTracker:
+    """
+    Create a CodeCarbon tracker for a sweep (run_id).
+    We deliberately keep it lightweight and file-output-free
+    because we log totals ourselves to JSONL.
+    """
+    return EmissionsTracker(
+        project_name="edge_cloud_early_exit",
+        experiment_id=run_id,
+        output_dir=log_dir,
+        save_to_file=False,     # we log ourselves
+        log_level="error",      # reduce noise
+    )
 
 
 def now_iso() -> str:
@@ -73,15 +99,6 @@ def health():
         "service": "cloud",
         "time_utc": now_iso(),
         "device": str(app.config.get("DEVICE")),
-    })
-
-
-@app.get("/ping")
-def ping():
-    return jsonify({
-        "status": "ok",
-        "service": "cloud",
-        "time_utc": now_iso(),
     })
 
 
@@ -169,6 +186,145 @@ def continue_inference():
     return pack_response(resp, request.headers.get("Accept", ""))
 
 
+@app.post("/energy/start")
+def energy_start_endpoint():
+    """
+    Starts an EmissionsTracker for a given run_id (one sweep).
+    Body: {"run_id": "..."}  (msgpack/json)
+    """
+    req_received_utc = now_iso()
+
+    try:
+        payload, used_ct = parse_payload()
+    except Exception as e:
+        return jsonify({"error": "bad_request", "message": str(e)}), 400
+
+    run_id = payload.get("run_id", None)
+    if not run_id or not isinstance(run_id, str):
+        return jsonify({"error": "bad_request", "message": "Missing/invalid 'run_id' (string)"}), 400
+
+    log_dir = app.config.get("LOG_DIR", DEFAULT_LOG_DIR)
+
+    with _TRACKERS_LOCK:
+        if run_id in _ACTIVE_TRACKERS:
+            # already started: idempotent success
+            resp = {
+                "status": "ok",
+                "service": app.config.get("SERVICE_NAME", "unknown"),
+                "run_id": run_id,
+                "started": False,
+                "message": "tracker already running",
+                "time_utc": now_iso(),
+                "received_content_type": used_ct,
+            }
+            return pack_response(resp, request.headers.get("Accept", ""))
+
+        tracker = _make_tracker(log_dir=log_dir, run_id=run_id)
+        tracker.start()
+        _ACTIVE_TRACKERS[run_id] = tracker
+
+    resp = {
+        "status": "ok",
+        "service": app.config.get("SERVICE_NAME", "unknown"),
+        "run_id": run_id,
+        "started": True,
+        "time_utc": now_iso(),
+        "received_content_type": used_ct,
+    }
+
+    # Optional: log start event
+    energy_log_path = ensure_energy_log_path(log_dir)
+    append_jsonl(energy_log_path, {
+        "event": "energy_start",
+        "time_utc": resp["time_utc"],
+        "req_received_utc": req_received_utc,
+        "run_id": run_id,
+    })
+
+    return pack_response(resp, request.headers.get("Accept", ""))
+
+
+@app.post("/energy/stop")
+def energy_stop_endpoint():
+    """
+    Stops a tracker for run_id and returns totals.
+    Body: {"run_id": "..."} (msgpack/json)
+    """
+    req_received_utc = now_iso()
+
+    try:
+        payload, used_ct = parse_payload()
+    except Exception as e:
+        return jsonify({"error": "bad_request", "message": str(e)}), 400
+
+    run_id = payload.get("run_id", None)
+    if not run_id or not isinstance(run_id, str):
+        return jsonify({"error": "bad_request", "message": "Missing/invalid 'run_id' (string)"}), 400
+
+    with _TRACKERS_LOCK:
+        tracker = _ACTIVE_TRACKERS.pop(run_id, None)
+
+    if tracker is None:
+        return jsonify({
+            "error": "not_found",
+            "message": f"No active tracker for run_id={run_id}. Did you call /energy/start?",
+        }), 404
+
+    # CodeCarbon returns emissions (kg CO2e) from stop()
+    try:
+        tracker.stop()
+    except Exception as e:
+        return jsonify({"error": "tracker_stop_failed", "message": str(e)}), 500
+
+    # Prefer notebook-style extraction
+    co2_kg = None
+    energy_kwh = None
+    duration_s = None
+
+    try:
+        data = tracker._prepare_emissions_data()  # internal but stable in your baseline
+        co2_kg = getattr(data, "emissions", None)
+        energy_kwh = getattr(data, "energy_consumed", None)
+        duration_s = getattr(data, "duration", None)
+    except Exception:
+        # Fallbacks across versions
+        print("Warning: failed to extract emissions data via _prepare_emissions_data()")
+        try:
+            fed = getattr(tracker, "final_emissions_data", None)
+            if fed is not None:
+                co2_kg = co2_kg if co2_kg is not None else getattr(fed, "emissions", None)
+                energy_kwh = energy_kwh if energy_kwh is not None else getattr(fed, "energy_consumed", None)
+                duration_s = duration_s if duration_s is not None else getattr(fed, "duration", None)
+        except Exception:
+            pass
+
+    resp = {
+        "status": "ok",
+        "service": app.config.get("SERVICE_NAME", "unknown"),
+        "run_id": run_id,
+        "co2_kg": float(co2_kg) if co2_kg is not None else None,
+        "energy_kwh": float(energy_kwh) if energy_kwh is not None else None,
+        "duration_s": float(duration_s) if duration_s is not None else None,
+        "time_utc": now_iso(),
+        "received_content_type": used_ct,
+    }
+
+    # Log stop event + totals
+    log_dir = app.config.get("LOG_DIR", DEFAULT_LOG_DIR)
+    energy_log_path = ensure_energy_log_path(log_dir)
+    append_jsonl(energy_log_path, {
+        "event": "energy_stop",
+        "time_utc": resp["time_utc"],
+        "req_received_utc": req_received_utc,
+        "run_id": run_id,
+        "co2_kg": resp["co2_kg"],
+        "energy_kwh": resp["energy_kwh"],
+        "duration_s": resp["duration_s"],
+    })
+
+    return pack_response(resp, request.headers.get("Accept", ""))
+
+
 def main():
     import argparse
 
@@ -194,6 +350,7 @@ def main():
     app.config["DEVICE"] = device
     app.config["CONT_MODEL"] = cont_model
     app.config["LOG_DIR"] = args.log_dir
+    app.config["SERVICE_NAME"] = "cloud"
 
     print(f"[cloud] starting on http://{args.host}:{args.port}")
     print(f"[cloud] device: {device}")
