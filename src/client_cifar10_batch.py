@@ -41,20 +41,19 @@ def policy_grids() -> Dict[str, Dict[str, List[float]]]:
     """
     return {
         "maxprob": {
-            "thr0": [0.70, 0.75, 0.80, 0.85, 0.90],
-            "thr1": [0.80, 0.85, 0.90, 0.93, 0.95],
+            "thr0": [0.55, 0.65, 0.75, 0.85, 0.92],
+            "thr1": [0.75, 0.85, 0.92, 0.96, 0.99],
         },
         "margin": {
-            "thr0": [0.10, 0.15, 0.20, 0.25, 0.30],
-            "thr1": [0.20, 0.25, 0.30, 0.35, 0.40],
+            "thr0": [0.30, 0.45, 0.60, 0.75, 0.85],
+            "thr1": [0.60, 0.75, 0.85, 0.92, 0.97],
         },
         "entropy": {
-            # Typical CIFAR-10 entropy ranges depend on calibration; this is a starter grid.
-            # More confident => LOWER entropy.
-            "thr0": [1.20, 1.10, 1.00, 0.90, 0.80],
-            "thr1": [1.00, 0.90, 0.80, 0.70, 0.60],
+            "thr0": [1.5, 1.2, 1.0, 0.8, 0.6, 0.4],
+            "thr1": [1.0, 0.8, 0.6, 0.4, 0.3, 0.2],
         },
     }
+
 
 
 # -----------------------------
@@ -455,7 +454,7 @@ def write_csv(csv_path: str, rows: List[SweepResult]) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--edge_url", default="http://147.102.19.162:5001", required=True, help="e.g. http://EDGE_IP:5001")
+    ap.add_argument("--edge_url", default="http://147.102.19.162:5001", help="e.g. http://EDGE_IP:5001")
     ap.add_argument(
         "--cloud_url",
         default="http://147.102.131.35:5002",
