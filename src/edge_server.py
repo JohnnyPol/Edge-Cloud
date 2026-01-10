@@ -564,7 +564,6 @@ def main():
         "--cloud_url",
         type=str,
         required=False,
-        default="http://147.102.131.35:5002",
         help="Cloud base URL (unused for now; offload is placeholder)",
     )
     ap.add_argument("--log_dir", type=str, default=DEFAULT_LOG_DIR)

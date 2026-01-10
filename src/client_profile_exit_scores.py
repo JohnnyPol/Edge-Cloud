@@ -48,7 +48,7 @@ def summarize(values: List[float]) -> Dict[str, float]:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--edge_url", default="http://147.102.19.162:5001", help="e.g. http://EDGE_IP:5001")
+    ap.add_argument("--edge_url",required=True, help="e.g. http://EDGE_IP:5001")
     ap.add_argument("--criterion", required=True,
                     choices=["maxprob", "margin", "entropy"])
     ap.add_argument("--num_samples", type=int, default=100)

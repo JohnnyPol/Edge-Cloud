@@ -454,11 +454,10 @@ def write_csv(csv_path: str, rows: List[SweepResult]) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--edge_url", default="http://147.102.19.162:5001", help="e.g. http://EDGE_IP:5001")
+    ap.add_argument("--edge_url", required=True, help="e.g. http://EDGE_IP:5001")
     ap.add_argument(
         "--cloud_url",
-        default="http://147.102.131.35:5002",
-        required=False,
+        required=True,
         help="Optional: for energy endpoints (same host as /continue).",
     )
     ap.add_argument(
@@ -467,7 +466,7 @@ def main():
     ap.add_argument(
         "--num_samples",
         type=int,
-        default=200,
+        default=-1,
         help="Number of CIFAR-10 test samples per sweep",
     )
     ap.add_argument(
@@ -495,10 +494,18 @@ def main():
     ds = datasets.CIFAR10(root=args.data_dir, train=False, download=True)
 
     # Deterministic indices (no label leak: we only use labels locally)
-    rng = np.random.default_rng(args.seed)
-    all_indices = np.arange(len(ds))
-    chosen = rng.choice(all_indices, size=min(args.num_samples, len(ds)), replace=False)
-    indices = [int(x) for x in chosen.tolist()]
+    if args.num_samples is None or args.num_samples <= 0:
+    # Full CIFAR-10 test set
+        indices = list(range(len(ds)))
+    else:
+        rng = np.random.default_rng(args.seed)
+        all_indices = np.arange(len(ds))
+        chosen = rng.choice(
+            all_indices,
+            size=min(args.num_samples, len(ds)),
+            replace=False,
+        )
+        indices = [int(x) for x in chosen.tolist()]
 
     grids = policy_grids()
 
@@ -521,7 +528,10 @@ def main():
                 sweep_triplets.append((criterion, float(thr0), float(thr1)))
 
     print(f"[client] edge_infer_url: {edge_infer_url}")
-    print(f"[client] num_samples per sweep: {len(indices)}  seed={args.seed}")
+    if args.num_samples <= 0:
+        print(f"[client] using FULL CIFAR-10 test set ({len(indices)} samples)")
+    else:
+        print(f"[client] num_samples per sweep: {len(indices)}  seed={args.seed}")
     print(f"[client] sweeps: {len(sweep_triplets)} total (criterion-specific grids)")
     print(f"[client] out_csv: {os.path.abspath(args.out_csv)}")
     print(f"[client] out_jsonl: {os.path.abspath(args.out_jsonl)}")
