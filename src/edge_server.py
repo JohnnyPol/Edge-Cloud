@@ -125,7 +125,7 @@ def build_infer_transform():
 def load_model(
     device: torch.device, backbone_ckpt: str, ee_ckpt: str, num_classes: int = 10
 ):
-    base = mobilevit_xxs()
+    base = mobilevit_xxs(num_classes=num_classes)
     base.load_state_dict(torch.load(backbone_ckpt, map_location="cpu"))
 
     policy_model = MobileViTWithPolicy(

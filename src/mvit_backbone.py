@@ -183,7 +183,7 @@ class MobileViT(nn.Module):
         self.mv2.append(MV2Block(channels[0], channels[1], 1, expansion))
         self.mv2.append(MV2Block(channels[1], channels[2], 2, expansion))
         self.mv2.append(MV2Block(channels[2], channels[3], 1, expansion))
-        self.mv2.append(MV2Block(channels[2], channels[3], 1, expansion))   # Repeat
+        self.mv2.append(MV2Block(channels[2], channels[3], 1, expansion))
         self.mv2.append(MV2Block(channels[3], channels[4], 2, expansion))
         self.mv2.append(MV2Block(channels[5], channels[6], 2, expansion))
         self.mv2.append(MV2Block(channels[7], channels[8], 2, expansion))
@@ -221,106 +221,22 @@ class MobileViT(nn.Module):
         return x
 
 
-def mobilevit_xxs():
+def mobilevit_xxs(num_classes=10):
     dims = [64, 80, 96]
     channels = [16, 16, 24, 24, 48, 48, 64, 64, 80, 80, 320]
-    return MobileViT((256, 256), dims, channels, num_classes=10, expansion=2)
+    return MobileViT((256, 256), dims, channels, num_classes=num_classes, expansion=2)
 
 
-def mobilevit_xs():
+def mobilevit_xs(num_classes=10):
     dims = [96, 120, 144]
     channels = [16, 32, 48, 48, 64, 64, 80, 80, 96, 96, 384]
-    return MobileViT((256, 256), dims, channels, num_classes=10)
+    return MobileViT((256, 256), dims, channels, num_classes=num_classes)
 
-
-def mobilevit_s():
+def mobilevit_s(num_classes=10):
     dims = [144, 192, 240]
     channels = [16, 32, 64, 64, 96, 96, 128, 128, 160, 160, 640]
-    return MobileViT((256, 256), dims, channels, num_classes=10)
+    return MobileViT((256, 256), dims, channels, num_classes=num_classes)
 
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-def data_loader(data_dir,
-                batch_size,
-                random_seed=42,
-                valid_size=0.1,
-                shuffle=True,
-                test=False):
-
-    normalize = transforms.Normalize(
-        mean=[0.4914, 0.4822, 0.4465],
-        std=[0.2023, 0.1994, 0.2010],
-    )
-
-    # Images Regularization
-    transform_original = transforms.Compose([
-        transforms.Resize((256,256)),
-        transforms.ToTensor(),
-        normalize,
-    ])
-
-    # Image Augmentation
-    transform_aug = transforms.Compose([
-        transforms.RandomResizedCrop(256, scale=(0.8,1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2,
-                               saturation=0.2, hue=0.1),
-        transforms.ToTensor(),
-        normalize,
-        transforms.RandomErasing(p=0.1)
-    ])
-
-    if test:
-        dataset = datasets.CIFAR10(
-            root=data_dir, train=False,
-            download=True, transform=transform_original
-        )
-
-        return DataLoader(
-            dataset, batch_size=batch_size, shuffle=shuffle
-        )
-
-    # Regular Dataset
-    train_dataset_orig = datasets.CIFAR10(
-        root=data_dir, train=True, download=True, transform=transform_original
-    )
-
-    # Augmented Dataset
-    train_dataset_aug = datasets.CIFAR10(
-        root=data_dir, train=True, download=True, transform=transform_aug
-    )
-
-
-    # Unify the training sets and separate their data from the validation set
-    num_train = len(train_dataset_orig)
-    indices = list(range(num_train))
-    split = int(np.floor(valid_size * num_train))
-
-    if shuffle:
-        np.random.seed(random_seed)
-        np.random.shuffle(indices)
-
-    train_idx, valid_idx = indices[split:], indices[:split]
-
-
-    train_dataset = ConcatDataset([
-        torch.utils.data.Subset(train_dataset_orig, train_idx),
-        torch.utils.data.Subset(train_dataset_aug, train_idx)
-    ])
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=4
-    )
-
-    valid_dataset = torch.utils.data.Subset(train_dataset_orig, valid_idx)
-    valid_loader = DataLoader(
-        valid_dataset, batch_size=1, shuffle=False, num_workers=4
-    )
-
-    return train_loader, valid_loader
-
-
