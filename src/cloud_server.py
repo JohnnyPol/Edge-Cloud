@@ -337,11 +337,12 @@ def main():
     # Model load
     ap.add_argument("--backbone_ckpt", type=str, required=True,
                     help="Path to mobileViT_xxs backbone checkpoint (e.g. ../data/mobileViT_xxs_10.pth)")
+    ap.add_argument("--num_classes", type=int, default=10)
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    base = mobilevit_xxs()
+    base = mobilevit_xxs(num_classes=args.num_classes)
     base.load_state_dict(torch.load(args.backbone_ckpt, map_location="cpu"))
     base = base.to(device).eval()
 
