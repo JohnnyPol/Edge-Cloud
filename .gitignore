@@ -2,3 +2,4 @@
 cifar-10*
 cifar-100*
 __pycache__/
+logs/
